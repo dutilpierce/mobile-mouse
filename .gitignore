@@ -1,0 +1,40 @@
+﻿# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Flutter/Dart
+.dart_tool/
+.packages
+.pub/
+build/
+**/build/
+coverage/
+*.log
+
+# Android
+**/android/.gradle/
+**/android/local.properties
+**/android/**/GeneratedPluginRegistrant.java
+**/android/**/generated/
+
+# iOS/macOS (if ever enabled)
+**/ios/Pods/
+**/ios/Runner.xcworkspace/
+**/ios/Flutter/Flutter.framework
+**/ios/Flutter/Flutter.podspec
+
+# Python
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.pyd
+**/.pytest_cache/
+**/.mypy_cache/
+**/.venv/
+**/venv/
+
+# Env files / secrets
+.env
+.env.*

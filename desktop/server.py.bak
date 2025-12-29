@@ -1,0 +1,212 @@
+import asyncio
+import json
+import os
+import platform
+import socket
+from dataclasses import dataclass
+
+import pyautogui
+import websockets
+
+# Zeroconf (mDNS) is optional because it can fail on some Python/Windows combos (e.g., Python 3.14).
+# You can disable mDNS by setting:
+#   $env:MOBILE_MOUSE_DISABLE_MDNS="1"
+try:
+    from zeroconf import ServiceInfo, Zeroconf
+except Exception:  # zeroconf not available or fails import
+    Zeroconf = None
+    ServiceInfo = None
+
+pyautogui.FAILSAFE = False
+
+PORT = int(os.environ.get("MOBILE_MOUSE_PORT", "8765"))
+SERVICE_TYPE = "_mobilemouse._tcp.local."
+SERVICE_NAME = None
+
+
+def env_truthy(name: str) -> bool:
+    v = os.environ.get(name, "").strip().lower()
+    return v in ("1", "true", "yes", "y", "on")
+
+
+DISABLE_MDNS = env_truthy("MOBILE_MOUSE_DISABLE_MDNS")
+
+
+@dataclass
+class ClientState:
+    peer: str
+    device_id: str | None = None
+
+
+def get_hostname():
+    try:
+        return socket.gethostname()
+    except Exception:
+        return "Computer"
+
+
+def get_local_ip():
+    hostname = get_hostname()
+    try:
+        ip = socket.gethostbyname(hostname)
+        if not ip.startswith("127."):
+            return ip
+    except Exception:
+        pass
+
+    # Fallback: pick primary interface by "connecting" a UDP socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    finally:
+        s.close()
+
+
+def create_zeroconf_service(port: int):
+    global SERVICE_NAME
+    hostname = get_hostname()
+    safe = "".join(c for c in hostname if c.isalnum() or c in ("-", "_"))[:32] or "Computer"
+    SERVICE_NAME = f"MobileMouse-{safe}.{SERVICE_TYPE}"
+
+    ip = get_local_ip()
+
+    info = ServiceInfo(
+        type_=SERVICE_TYPE,
+        name=SERVICE_NAME,
+        addresses=[socket.inet_aton(ip)],
+        port=port,
+        properties={
+            "name": hostname,
+            "host": ip,  # helpful for some resolvers
+            "os": platform.system(),
+            "ver": "0.1.0",
+            "proto": "ws-json",
+        },
+        server=f"{safe}.local.",
+    )
+    return info
+
+
+async def handle(ws):
+    state = ClientState(peer=str(ws.remote_address))
+    print(f"[+] client connected: {state.peer}")
+
+    async for msg in ws:
+        try:
+            data = json.loads(msg)
+        except Exception:
+            await ws.send(json.dumps({"type": "error", "message": "invalid json"}))
+            continue
+
+        t = data.get("type")
+        if t == "hello":
+            state.device_id = data.get("deviceId")
+            await ws.send(json.dumps({"type": "welcome", "serverVersion": "0.1.0", "name": get_hostname()}))
+        elif t == "ping":
+            await ws.send(json.dumps({"type": "pong", "t": data.get("t")}))
+        elif t == "mouse_move":
+            dx = float(data.get("dx", 0))
+            dy = float(data.get("dy", 0))
+            pyautogui.moveRel(dx, dy, duration=0)
+        elif t == "mouse_click":
+            button = data.get("button", "left")
+            action = data.get("action", "click")
+            if action == "click":
+                pyautogui.click(button=button)
+            elif action == "down":
+                pyautogui.mouseDown(button=button)
+            elif action == "up":
+                pyautogui.mouseUp(button=button)
+        elif t == "mouse_scroll":
+            dx = int(float(data.get("dx", 0)))
+            dy = int(float(data.get("dy", 0)))
+            if dy:
+                pyautogui.scroll(dy)
+            if dx:
+                try:
+                    pyautogui.hscroll(dx)
+                except Exception:
+                    pass
+        elif t == "key_text":
+            text = data.get("text", "")
+            if text:
+                pyautogui.typewrite(text, interval=0)
+        elif t == "key_press":
+            key = data.get("key")
+            if key:
+                pyautogui.press(key)
+        elif t == "shortcut":
+            keys = data.get("keys") or []
+            keys = [str(k).lower() for k in keys if k]
+            if keys:
+                pyautogui.hotkey(*keys)
+        else:
+            await ws.send(json.dumps({"type": "error", "message": f"unknown type: {t}"}))
+
+    print(f"[-] client disconnected: {state.peer}")
+
+
+async def main():
+    ip = get_local_ip()
+
+    zeroconf = None
+    info = None
+
+    # Only try mDNS if not disabled and zeroconf is importable
+    if not DISABLE_MDNS and Zeroconf is not None and ServiceInfo is not None:
+        try:
+            zeroconf = Zeroconf()
+            info = create_zeroconf_service(PORT)
+            zeroconf.register_service(info)
+            print(f"Advertising as {info.name} on {ip}:{PORT}")
+        except Exception as e:
+            print("! mDNS advertising failed. Continuing WITHOUT discovery.")
+            print(f"! Reason: {e}")
+            try:
+                if zeroconf and info:
+                    zeroconf.unregister_service(info)
+            except Exception:
+                pass
+            try:
+                if zeroconf:
+                    zeroconf.close()
+            except Exception:
+                pass
+            zeroconf = None
+            info = None
+    else:
+        print("mDNS discovery is DISABLED. (Manual IP connect mode)")
+
+    print(f"MobileMouse Companion listening on ws://0.0.0.0:{PORT}")
+    print(f"Connect from phone to: ws://{ip}:{PORT}")
+
+    try:
+        async with websockets.serve(
+    handle,
+    "0.0.0.0",
+    PORT,
+    max_size=2**20,
+    ping_interval=None,   # don't send keepalive pings
+    ping_timeout=None,    # don't kill idle connections
+):
+
+            await asyncio.Future()  # run forever
+    finally:
+        try:
+            if zeroconf and info:
+                zeroconf.unregister_service(info)
+        except Exception:
+            pass
+        try:
+            if zeroconf:
+                zeroconf.close()
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
